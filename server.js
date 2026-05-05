@@ -2,11 +2,11 @@
  * QM Pin Renderer — Puppeteer service.
  *
  * POST /render
- *   body: { html, viewport_width=1440, viewport_height=2250, ms_delay=800 }
+ *   body: { html, viewport_width=1080, viewport_height=1920, ms_delay=1500 }
  *   response: image/png
  *
- * Runs on Render.com free tier (or any Node host). Reuses one browser
- * across requests to avoid the 1-2s Chrome startup cost per pin.
+ * Self-healing: recycles the browser every RESTART_EVERY renders so Chromium
+ * memory creep does not OOM the 512 MB Render instance.
  */
 
 const express = require('express');
@@ -16,7 +16,9 @@ const chromium = require('@sparticuz/chromium');
 const app = express();
 app.use(express.json({ limit: '15mb' }));
 
+const RESTART_EVERY = Number(process.env.RESTART_EVERY || 5);
 let browserPromise = null;
+let renderCount = 0;
 
 async function getBrowser() {
   if (!browserPromise) {
@@ -33,19 +35,31 @@ async function getBrowser() {
       defaultViewport: null
     });
     const b = await browserPromise;
-    b.on('disconnected', () => { browserPromise = null; });
+    b.on('disconnected', () => { browserPromise = null; renderCount = 0; });
   }
   return browserPromise;
 }
 
+async function recycleBrowserIfNeeded() {
+  if (renderCount >= RESTART_EVERY && browserPromise) {
+    try {
+      const b = await browserPromise;
+      await b.close();
+    } catch (_) {}
+    browserPromise = null;
+    renderCount = 0;
+  }
+}
+
 app.post('/render', async (req, res) => {
   const start = Date.now();
+  await recycleBrowserIfNeeded();
   const {
     html,
-    viewport_width = 1440,
-    viewport_height = 2250,
+    viewport_width = 1080,
+    viewport_height = 1920,
     device_scale = 1,
-    ms_delay = 800
+    ms_delay = 1500
   } = req.body || {};
 
   if (!html || typeof html !== 'string') {
@@ -71,8 +85,10 @@ app.post('/render', async (req, res) => {
       fullPage: false,
       clip: { x: 0, y: 0, width: Number(viewport_width), height: Number(viewport_height) }
     });
+    renderCount++;
     res.setHeader('Content-Type', 'image/png');
     res.setHeader('X-Render-Ms', String(Date.now() - start));
+    res.setHeader('X-Render-Count', String(renderCount));
     res.send(png);
   } catch (err) {
     console.error('render error:', err);
@@ -87,7 +103,13 @@ app.post('/render', async (req, res) => {
 app.get('/healthz', async (req, res) => {
   try {
     const browser = await getBrowser();
-    res.json({ ok: true, browserConnected: browser.isConnected(), ts: Date.now() });
+    res.json({
+      ok: true,
+      browserConnected: browser.isConnected(),
+      renderCount,
+      restartEvery: RESTART_EVERY,
+      ts: Date.now()
+    });
   } catch (err) {
     res.status(503).json({ ok: false, error: String(err && err.message || err) });
   }
@@ -96,11 +118,12 @@ app.get('/healthz', async (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     service: 'qm-pin-renderer',
-    endpoints: { render: 'POST /render', health: 'GET /healthz' }
+    endpoints: { render: 'POST /render', health: 'GET /healthz' },
+    config: { RESTART_EVERY }
   });
 });
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
-  console.log('QM Pin Renderer listening on port', port);
+  console.log('QM Pin Renderer listening on port', port, '(recycle every', RESTART_EVERY, 'renders)');
 });
